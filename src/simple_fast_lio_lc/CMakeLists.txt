@@ -55,6 +55,7 @@ find_package(catkin REQUIRED COMPONENTS
 # # System dependencies are found with CMake's conventions
 # find_package(Boost REQUIRED COMPONENTS system)
 find_package(Eigen3 REQUIRED)
+find_package(small_gicp REQUIRED)
 find_package(PCL 1.10 REQUIRED COMPONENTS
   common
   filters
@@ -174,6 +175,7 @@ include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${GTSAM_INCLUDE_DIR}
+  ${small_gicp_INCLUDE_DIR}
 )
 
 # # Declare a C++ library
@@ -209,6 +211,8 @@ target_link_libraries(slammapping
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
   gtsam
+  ${small_gicp_LIBRARIES}
+  small_gicp::small_gicp
 )
 
 # ############

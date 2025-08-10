@@ -26,6 +26,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <omp.h>
 #include <ostream>
 #include <pcl/features/normal_3d.h> // 法向量计算
 #include <pcl/filters/approximate_voxel_grid.h>
@@ -37,6 +38,12 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <ros/publisher.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <small_gicp/benchmark/read_points.hpp>
+#include <small_gicp/pcl/pcl_point.hpp>
+#include <small_gicp/pcl/pcl_point_traits.hpp>
+#include <small_gicp/pcl/pcl_registration.hpp>
+#include <small_gicp/registration/registration_helper.hpp>
+#include <small_gicp/util/downsampling_omp.hpp>
 #include <thread>
 #include <vector>
 #define INIT_TIME (0.1)
@@ -85,7 +92,7 @@ private:
   double key_frame_adding_angle_threshold_ = 0.2;
   double key_frame_adding_distance_threshold_ = 0.5;
   pcl::KdTreeFLANN<PointType>::Ptr kdtree_history_key_poses_;
-  float history_keyframe_search_radius_ = 50.0;
+  float history_keyframe_search_radius_ = 15.0;
   float history_keyframe_search_time_diff_ = 30.0;
   int history_keyframe_search_num_ = 25;
   float history_keyframe_fitness_score_ = 0.5;
@@ -118,7 +125,7 @@ private:
   std::mutex mtx_loop_info_;
   // 非线性优化器
   gtsam::ISAM2 *isam;
-  bool loop_closure_enable_flag_ = false;
+  bool loop_closure_enable_flag_ = true;
 
   // 做回环检测时使用ICP时的点云降采样器
   pcl::VoxelGrid<PointType> down_size_filter_icp_;
@@ -754,7 +761,7 @@ private:
     if (cloud_key_poses_3D_->empty()) {
       gtsam::noiseModel::Diagonal::shared_ptr priorNoise =
           gtsam::noiseModel::Diagonal::Variances(
-              (gtsam::Vector(6) << 1e-8, 1e-8, 1e-8, 1e8, 1e8, 1e8)
+              (gtsam::Vector(6) << 1e-8, 1e-8, 1e-8, 1e-8, 1e-8, 1e-8)
                   .finished()); // rad*rad, meter*meter
       gtsam_graph_.add(gtsam::PriorFactor<gtsam::Pose3>(
           0, trans2gtsamPose(state_point_.pos, state_point_.rot), priorNoise));
@@ -763,7 +770,7 @@ private:
     } else {
       gtsam::noiseModel::Diagonal::shared_ptr odometryNoise =
           gtsam::noiseModel::Diagonal::Variances(
-              (gtsam::Vector(6) << 1e-6, 1e-6, 1e-6, 1e8, 1e8, 1e8).finished());
+              (gtsam::Vector(6) << 1e-5, 1e-5, 1e-5, 1e5, 1e5, 1e5).finished());
       gtsam::Pose3 poseFrom = pclPointTogtsamPose3(cloud_key_poses_6D_->back());
 
       gtsam::Pose3 poseTo = trans2gtsamPose(state_point_.pos, state_point_.rot);
@@ -830,7 +837,6 @@ private:
     if (detectLoopClosureDistance(&loopKeyCur, &loopKeyPre) == false)
       return;
 
-    // extract cloud
     pcl::PointCloud<PointType>::Ptr cureKeyframeCloud(
         new pcl::PointCloud<PointType>());
     pcl::PointCloud<PointType>::Ptr prevKeyframeCloud(
@@ -859,74 +865,167 @@ private:
     //   p_pcl_pub->publish(laserCloudMap);
     // }
     // 2. 移除无效点（包含NaN/Inf的点）
-    pcl::PointCloud<PointType>::Ptr source_filtered(
-        new pcl::PointCloud<PointType>());
-    pcl::PointCloud<PointType>::Ptr target_filtered(
-        new pcl::PointCloud<PointType>());
-    std::vector<int> indices;
-    pcl::removeNaNFromPointCloud(*cureKeyframeCloud, *source_filtered, indices);
-    pcl::removeNaNFromPointCloud(*prevKeyframeCloud, *target_filtered, indices);
+    double t1 = omp_get_wtime();
+    // pcl::PointCloud<PointType>::Ptr source_filtered(
+    //     new pcl::PointCloud<PointType>());
+    // pcl::PointCloud<PointType>::Ptr target_filtered(
+    //     new pcl::PointCloud<PointType>());
+    // std::vector<int> indices;
+    // pcl::removeNaNFromPointCloud(*cureKeyframeCloud, *source_filtered,
+    // indices); pcl::removeNaNFromPointCloud(*prevKeyframeCloud,
+    // *target_filtered, indices);
 
-    // 3. 计算法向量（如果点云没有预计算法向量）
-    static pcl::NormalEstimation<PointType, PointType> ne;
-    pcl::search::KdTree<PointType>::Ptr tree(
-        new pcl::search::KdTree<PointType>());
-    ne.setSearchMethod(tree);
-    ne.setKSearch(20); // 使用20个最近邻计算法向量
+    // static pcl::NormalEstimation<PointType, PointType> ne;
+    // pcl::search::KdTree<PointType>::Ptr tree(
+    //     new pcl::search::KdTree<PointType>());
+    // ne.setSearchMethod(tree);
+    // ne.setKSearch(20); // 使用20个最近邻计算法向量
 
-    // 计算源点云法向量（结果会填充到PointXYZINormal的normal字段）
-    ne.setInputCloud(source_filtered);
-    ne.compute(*source_filtered);
+    // ne.setInputCloud(source_filtered);
+    // ne.compute(*source_filtered);
 
-    // 计算目标点云法向量
-    ne.setInputCloud(target_filtered);
-    ne.compute(*target_filtered);
-    // 7.
-    // 调用ICP降当前帧匹配到局部地图，得到当前帧位姿的偏差，将偏差应用到当前帧的位姿，得到修正后的当前帧位姿。
-    static pcl::IterativeClosestPointWithNormals<PointType, PointType> icp;
+    // // 计算目标点云法向量
+    // ne.setInputCloud(target_filtered);
+    // ne.compute(*target_filtered);
 
+    // static pcl::IterativeClosestPointWithNormals<PointType, PointType> icp;
+
+    // // icp.setMaxCorrespondenceDistance(history_keyframe_search_radius_ * 2);
     // icp.setMaxCorrespondenceDistance(history_keyframe_search_radius_ * 2);
-    icp.setMaxCorrespondenceDistance(history_keyframe_search_radius_ * 2);
-    icp.setMaximumIterations(300);
-    icp.setTransformationEpsilon(1e-8);
-    icp.setEuclideanFitnessEpsilon(1e-8);
-    icp.setRANSACIterations(0);
+    // icp.setMaximumIterations(300);
+    // icp.setTransformationEpsilon(1e-8);
+    // icp.setEuclideanFitnessEpsilon(1e-8);
+    // icp.setRANSACIterations(0);
 
-    // Align clouds
-    icp.setInputSource(source_filtered);
-    icp.setInputTarget(target_filtered);
-    pcl::PointCloud<PointType>::Ptr unused_result(
+    // // Align clouds
+    // icp.setInputSource(source_filtered);
+    // icp.setInputTarget(target_filtered);
+    // pcl::PointCloud<PointType>::Ptr unused_result(
+    //     new pcl::PointCloud<PointType>());
+    // icp.align(*unused_result);
+    // // if (p_pcl_pub != nullptr) {
+    // //   sensor_msgs::PointCloud2 laserCloudMap;
+    // //   pcl::toROSMsg(*unused_result, laserCloudMap);
+    // //   // laserCloudMap.header.stamp = ros::Time().fromSec(1);
+    // //   laserCloudMap.header.frame_id = "camera_init";
+    // //   p_pcl_pub->publish(laserCloudMap);
+    // // }
+    // std::cout << "分数：" << icp.getFitnessScore() <<"
+    // 配准耗时："<<omp_get_wtime()-t1<<std::endl;
+
+    // if (icp.hasConverged() == false ||
+    //     icp.getFitnessScore() > history_keyframe_fitness_score_)
+    //   return;
+
+    // float x, y, z;
+    // Eigen::Quaternionf quat;
+    // Eigen::Affine3f correctionLidarFrame;
+    // correctionLidarFrame = icp.getFinalTransformation();
+    // // transform from world origin to wrong pose
+    // Eigen::Affine3f tWrong =
+    //     pclPointToAffine3f(copy_cloud_key_poses_6D_->points[loopKeyCur]);
+    // // transform from world origin to corrected pose
+    // Eigen::Affine3f tCorrect =
+    //     correctionLidarFrame *
+    //     tWrong; // pre-multiplying -> successive rotation about a fixed frame
+    // x = tCorrect.translation().x();
+    // y = tCorrect.translation().y();
+    // z = tCorrect.translation().z();
+    // quat = Eigen::Quaternionf(tCorrect.rotation());
+
+    // gtsam::Pose3 poseFrom = gtsam::Pose3(
+    //     gtsam::Rot3::Quaternion(quat.w(), quat.x(), quat.y(), quat.z()),
+    //     gtsam::Point3(x, y, z));
+    // gtsam::Pose3 poseTo =
+    //     pclPointTogtsamPose3(copy_cloud_key_poses_6D_->points[loopKeyPre]);
+    // gtsam::Vector Vector6(6);
+    // float noiseScore = 1e-6;
+    // Vector6 << noiseScore, noiseScore, noiseScore, noiseScore, noiseScore,
+    //     noiseScore;
+    // gtsam::noiseModel::Diagonal::shared_ptr constraintNoise =
+    //     gtsam::noiseModel::Diagonal::Variances(Vector6);
+
+    pcl::PointCloud<PointType>::Ptr source_cloud(
         new pcl::PointCloud<PointType>());
-    icp.align(*unused_result);
-    // if (p_pcl_pub != nullptr) {
-    //   sensor_msgs::PointCloud2 laserCloudMap;
-    //   pcl::toROSMsg(*unused_result, laserCloudMap);
-    //   // laserCloudMap.header.stamp = ros::Time().fromSec(1);
-    //   laserCloudMap.header.frame_id = "camera_init";
-    //   p_pcl_pub->publish(laserCloudMap);
-    // }
-    std::cout << "分数：" << icp.getFitnessScore() << std::endl;
-    if (icp.hasConverged() == false ||
-        icp.getFitnessScore() > history_keyframe_fitness_score_)
+    pcl::PointCloud<PointType>::Ptr target_cloud(
+        new pcl::PointCloud<PointType>());
+
+
+    std::vector<int> indices;
+    pcl::removeNaNFromPointCloud(*cureKeyframeCloud, *source_cloud, indices);
+    pcl::removeNaNFromPointCloud(*prevKeyframeCloud, *target_cloud, indices);
+
+ 
+    std::vector<Eigen::Vector4f> eigen_points_source;
+    std::vector<Eigen::Vector4f> eigen_points_target;
+    eigen_points_source.reserve(source_cloud->size());
+    eigen_points_target.reserve(target_cloud->size());
+
+    for (const auto &point : *source_cloud) {
+      // 过滤NaN点（如果开启）
+      if ((std::isnan(point.x) || std::isnan(point.y) || std::isnan(point.z))) {
+        continue;
+      }
+      // 转换为齐次坐标（w=1.0）
+      Eigen::Vector4f eigen_point;
+      eigen_point << point.x, point.y, point.z, 1.0f;
+      eigen_points_source.push_back(eigen_point);
+    }
+    for (const auto &point : *target_cloud) {
+      // 过滤NaN点（如果开启）
+      if ((std::isnan(point.x) || std::isnan(point.y) || std::isnan(point.z))) {
+        continue;
+      }
+
+      // 转换为齐次坐标（w=1.0）
+      Eigen::Vector4f eigen_point;
+      eigen_point << point.x, point.y, point.z, 1.0f;
+      eigen_points_target.push_back(eigen_point);
+    }
+
+    small_gicp::RegistrationSetting setting;
+    setting.num_threads = 1;               // Number of threads to be used
+    setting.downsampling_resolution = 0.25; // Downsampling resolution
+    setting.max_correspondence_distance = 3.0;
+    // setting.type=small_gicp::RegistrationSetting::RegistrationType::ICP;
+
+    Eigen::Isometry3d init_T_target_source = Eigen::Isometry3d::Identity();
+    small_gicp::RegistrationResult result =
+        align(eigen_points_target, eigen_points_source, init_T_target_source,
+              setting);
+
+    // std::cout << "--- T_target_source ---" << std::endl
+    //           << result.T_target_source.matrix() << std::endl;
+    // std::cout << "converged:" << result.converged << std::endl;
+    // std::cout << "error:" << result.error << std::endl;
+    // std::cout << "iterations:" << result.iterations << std::endl;
+    // std::cout << "num_inliers:" << result.num_inliers << std::endl;
+    // std::cout << "--- H ---" << std::endl << result.H << std::endl;
+    // std::cout << "--- b ---" << std::endl << result.b.transpose() << std::endl;
+
+    // 计算适应度分数（这里使用平均误差作为参考）
+    auto fitness_score = result.error / std::max(1, (int)result.num_inliers);
+    std::cout << "适应度分数：" << fitness_score << " 配准耗时："
+              << omp_get_wtime() - t1 << std::endl;
+
+    // 检查配准是否成功
+    if (!result.converged || fitness_score > history_keyframe_fitness_score_)
       return;
 
-    // 8.
-    // 根据修正后的当前帧位姿和匹配帧的位姿，计算帧间相对位姿，这个位姿被用来作为回环因子。同时，将ICP的匹配分数当作因子的噪声模型
-    float x, y, z;
-    Eigen::Quaternionf quat;
-    Eigen::Affine3f correctionLidarFrame;
-    correctionLidarFrame = icp.getFinalTransformation();
-    // transform from world origin to wrong pose
+    // 8. 处理配准结果，获取修正后的位姿
+    Eigen::Matrix4f correctionMatrix =
+        result.T_target_source.matrix().cast<float>();
+    Eigen::Affine3f correctionLidarFrame(correctionMatrix);
+
+    // 以下部分保持不变
     Eigen::Affine3f tWrong =
         pclPointToAffine3f(copy_cloud_key_poses_6D_->points[loopKeyCur]);
-    // transform from world origin to corrected pose
-    Eigen::Affine3f tCorrect =
-        correctionLidarFrame *
-        tWrong; // pre-multiplying -> successive rotation about a fixed frame
-    x = tCorrect.translation().x();
-    y = tCorrect.translation().y();
-    z = tCorrect.translation().z();
-    quat = Eigen::Quaternionf(tCorrect.rotation());
+    Eigen::Affine3f tCorrect = correctionLidarFrame * tWrong;
+
+    float x = tCorrect.translation().x();
+    float y = tCorrect.translation().y();
+    float z = tCorrect.translation().z();
+    Eigen::Quaternionf quat(tCorrect.rotation());
 
     gtsam::Pose3 poseFrom = gtsam::Pose3(
         gtsam::Rot3::Quaternion(quat.w(), quat.x(), quat.y(), quat.z()),
@@ -934,7 +1033,7 @@ private:
     gtsam::Pose3 poseTo =
         pclPointTogtsamPose3(copy_cloud_key_poses_6D_->points[loopKeyPre]);
     gtsam::Vector Vector6(6);
-    float noiseScore = icp.getFitnessScore();
+    float noiseScore = 1e-6;
     Vector6 << noiseScore, noiseScore, noiseScore, noiseScore, noiseScore,
         noiseScore;
     gtsam::noiseModel::Diagonal::shared_ptr constraintNoise =
